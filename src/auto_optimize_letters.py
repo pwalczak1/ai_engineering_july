@@ -2,11 +2,12 @@
 """
 Auto-optimize a prompt for letter-repetition reasoning in country names.
 
-Uses AdalFlow to train both the system prompt (via text-grad) and
-few-shot demonstrations (via bootstrap few-shot) so that a GPT-4o
-task model learns to answer questions like:
+Training uses **closed-set** questions only: countries are listed in the
+prompt, and labels are recomputed with ``letter_repeat_oracle`` so the model
+is never rewarded for memorizing a debatable global answer.
 
-    "What country has the same letter repeated the most in its name?"
+After training, the script evaluates the open-ended question using a
+**pycountry** oracle (English short names, stable tie-break).
 
 The optimizer, teacher, and backward engine all run on o3-mini.
 
@@ -16,6 +17,8 @@ The optimizer, teacher, and backward engine all run on o3-mini.
 """
 
 import os
+import sys
+from pathlib import Path
 
 if "OPENAI_API_KEY" not in os.environ:
     raise ValueError("Please set the OPENAI_API_KEY environment variable.")
@@ -23,11 +26,20 @@ if "OPENAI_API_KEY" not in os.environ:
 import json
 from typing import Dict, Union
 
+_SRC = Path(__file__).resolve().parent
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
 import adalflow as adal
 from adalflow.components.model_client.openai_client import OpenAIClient
 from adalflow.datasets.types import Example
 from adalflow.eval.answer_match_acc import AnswerMatchAcc
 from adalflow.optim.types import ParameterType
+
+from letter_repeat_oracle import (
+    global_expected_answer_pycountry,
+    relabel_closed_set_row,
+)
 
 # ---------------------------------------------------------------------------
 # Prompt template (Jinja2)
@@ -57,21 +69,21 @@ class LetterRepeatTaskPipeline(adal.Component):
             data=(
                 "You will answer a reasoning question about letter patterns in "
                 "country names. Think step by step.\n"
-                "1. Identify the candidate countries. If countries are listed in "
-                "the question, use those. If no countries are listed, recall "
-                "real country names from around the world — especially those "
-                "known for long names or heavy vowel repetition (e.g. "
-                "Madagascar, Canada, Jamaica, Australia, Bahamas, etc.).\n"
-                "2. For each candidate, spell its name letter by letter "
-                "(case-insensitive) and count how many times each distinct "
-                "letter appears.\n"
-                "3. Record the maximum count of any single letter for each "
-                "country name.\n"
-                "4. Compare the maximum counts across all candidates.\n"
-                "5. The country whose name has the highest single-letter "
-                "repetition count is the answer. For example, 'Madagascar' "
-                "has the letter 'a' appearing 4 times (M-a-d-a-g-a-s-c-a-r), "
-                "which is the highest of any country.\n"
+                "1. Identify every candidate country name in the question. If "
+                "the question lists countries explicitly, use only that list — "
+                "do not substitute other countries.\n"
+                "2. For each candidate, consider only letters A–Z / a–z "
+                "(case-insensitive). Count how many times each distinct letter "
+                "appears.\n"
+                "3. For each country name, find the maximum count of any single "
+                "letter in that name.\n"
+                "4. Compare those maxima across candidates. The answer is the "
+                "country whose name achieves the highest such count. If two "
+                "countries tie, pick the one that comes first alphabetically "
+                "(A–Z) by full country name.\n"
+                "5. Example (illustration only): among 'Madagascar', 'Canada', "
+                "'Brazil', the max single-letter counts are 4, 3, and 1 "
+                "respectively — so the answer would be Madagascar.\n"
                 "The last line of your response MUST be exactly: "
                 "'Answer: $VALUE' where VALUE is the country name."
             ),
@@ -151,6 +163,20 @@ def load_datasets(
 
     if max_samples:
         data = data[:max_samples]
+
+    mismatches = 0
+    for row in data:
+        new_target, bad = relabel_closed_set_row(
+            row["input"], row.get("target", "")
+        )
+        if bad:
+            mismatches += 1
+        row["target"] = new_target
+    if mismatches:
+        print(
+            f"Relabeled {mismatches} example(s) where JSON target differed "
+            "from the closed-set oracle."
+        )
 
     for idx, row in enumerate(data):
         row["id"] = str(idx)
@@ -256,7 +282,7 @@ def evaluate_target_question(adal_component):
     TARGET_QUESTION = (
         "What country has the same letter repeated the most in its name?"
     )
-    EXPECTED_ANSWER = "Madagascar"
+    expected_answer, oracle_score = global_expected_answer_pycountry()
 
     adal_component.task.eval()
     result = adal_component.task.bicall(
@@ -267,11 +293,16 @@ def evaluate_target_question(adal_component):
     print("POST-TRAINING EVALUATION — TARGET QUESTION")
     print("=" * 60)
     print(f"Question : {TARGET_QUESTION}")
-    print(f"Expected : {EXPECTED_ANSWER}")
+    print(
+        "Oracle     : pycountry English short names (ISO 3166-1); "
+        f"max single-letter count = {oracle_score}; ties break A→Z by name."
+    )
+    print(f"Expected   : {expected_answer}")
     print(f"Raw reply: {result}")
     if hasattr(result, "data") and result.data is not None:
         print(f"Parsed   : {result.data}")
-        correct = EXPECTED_ANSWER.lower() in str(result.data).lower()
+        pred = str(result.data).lower()
+        correct = expected_answer.lower() in pred
         print(f"Correct  : {'YES' if correct else 'NO'}")
     print("=" * 60)
 

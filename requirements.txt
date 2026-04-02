@@ -2,3 +2,4 @@ openai
 adalflow[openai]
 torch
 datasets
+pycountry
