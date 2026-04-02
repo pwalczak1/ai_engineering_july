@@ -1,0 +1,28 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# AdalFlow / ML tooling (local caches)
+.adalflow/
